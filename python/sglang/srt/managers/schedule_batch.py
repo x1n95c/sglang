@@ -2104,7 +2104,7 @@ class Req(ReqDllmMixin):
             return None
         if not isinstance(req_to_token_pool, HybridReqToTokenPool):
             return None
-        return req_to_token_pool.mamba_pool
+        return allocator.state.pool
 
     def offload_kv_cache(self, req_to_token_pool, token_to_kv_pool_allocator):
         token_indices = req_to_token_pool.req_to_token[
@@ -2135,7 +2135,7 @@ class Req(ReqDllmMixin):
         # Loads both the kv cache and mamba state if exists
         mamba_cpu = self.kv.retraction_backup.mamba_cpu
         if mamba_cpu is not None and self.kv.holds_mamba:
-            req_to_token_pool.mamba_pool.load_cpu_copy(
+            token_to_kv_pool_allocator.state.pool.load_cpu_copy(
                 mamba_cpu, self.kv.mamba_pool_idx.unsqueeze(0)
             )
         token_to_kv_pool_allocator.load_cpu_copy(
@@ -3641,7 +3641,7 @@ class ScheduleBatch(ScheduleBatchDisaggregationDecodeMixin):
             else:
                 # No evict-retry: a transient slot is not worth evicting a
                 # cached checkpoint for; on failure tracking degrades in place.
-                new_slot = pool.mamba_allocator.alloc(1)
+                new_slot = self.token_to_kv_pool_allocator.state_slots.alloc(1)
             if new_slot is not None:
                 pool.set_mamba_ping_pong_slot(req, other_idx, new_slot[0])
                 req.kv.mamba_next_track_idx = other_idx
@@ -3665,7 +3665,7 @@ class ScheduleBatch(ScheduleBatchDisaggregationDecodeMixin):
             if buf[1 - next_idx].item() == -1:
                 # The prealloc failed, so tracking would have been in place.
                 continue
-            pool.mamba_allocator.free(buf[next_idx].unsqueeze(0))
+            self.token_to_kv_pool_allocator.state_slots.free(buf[next_idx].unsqueeze(0))
             pool.set_mamba_ping_pong_slot(req, next_idx, -1)
             req.kv.mamba_next_track_idx = 1 - next_idx
 
@@ -3700,7 +3700,7 @@ class ScheduleBatch(ScheduleBatchDisaggregationDecodeMixin):
                 else:
                     # No evict-retry: a transient slot is not worth
                     # evicting a cached checkpoint for.
-                    new_slot = pool.mamba_allocator.alloc(1)
+                    new_slot = self.token_to_kv_pool_allocator.state_slots.alloc(1)
                 if new_slot is not None:
                     pool.set_mamba_ping_pong_slot(req, other_idx, new_slot[0])
                     has_pending = True

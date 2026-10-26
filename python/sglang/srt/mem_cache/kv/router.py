@@ -68,6 +68,7 @@ class KVLayerRouter:
         self._layers = layers
         self._part_layers: Dict[Tuple[int, str], KVLayer] = {}
         self._part_layer_ids: Dict[str, Tuple[int, ...]] = {}
+        self._part_views: Dict[str, Any] = {}
         self._parts_load_layer_wise = False
 
     @classmethod
@@ -118,6 +119,19 @@ class KVLayerRouter:
                 ),
             )
         self._part_layer_ids[part] = tuple(sorted(indices))
+        self._part_views[part] = view
+
+    def part_indices(self, part: str) -> Dict[int, int]:
+        """Each routed layer's index in the bound part's view."""
+        return {
+            layer_id: self._part_layers[(layer_id, part)].route.index
+            for layer_id in self._part_layer_ids.get(part, ())
+        }
+
+    def part_view(self, part: str) -> Optional[Any]:
+        """The view a bound part's layers share, or None when no part of that
+        name is bound."""
+        return self._part_views.get(part)
 
     def load_parts_layer_wise(self) -> None:
         """The host stack restores the bound parts layer by layer, as it does
