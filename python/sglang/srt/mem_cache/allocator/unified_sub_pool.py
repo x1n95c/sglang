@@ -290,6 +290,8 @@ class MultiEndedAllocator(BaseTokenToKVPoolAllocator):
     watermark_physical: _CapacityField[int] = _CapacityField()
     live_page_count: _CapacityField[int] = _CapacityField()
     _free_phys_pages: _CapacityField[torch.Tensor] = _CapacityField()
+    # The owner's unminted virtual pages (None on a band that binds the owner's).
+    free_virtual_ids: _CapacityField[Optional[torch.Tensor]] = _CapacityField()
 
     def __init__(
         self,
