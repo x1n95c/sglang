@@ -863,6 +863,7 @@ class HybridCacheController(BaseHiCacheController):
                     host_indices=host_indices,
                     device_indices=device_indices,
                     layer_mapper=anchor.layer_mapper,
+                    device_translate=anchor.device_translate,
                 )
             )
         for pool_transfer in pool_transfers or []:
@@ -884,6 +885,7 @@ class HybridCacheController(BaseHiCacheController):
                     host_indices=pool_transfer.host_indices,
                     device_indices=pool_transfer.device_indices,
                     layer_mapper=entry.layer_mapper,
+                    device_translate=entry.device_translate,
                 )
             )
         return transfers
