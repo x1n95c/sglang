@@ -9,7 +9,6 @@ from typing import TYPE_CHECKING, Any, Optional
 import msgspec
 import torch
 
-from sglang.srt.arg_groups.kv_cache_hook import TRANSLATED_MHA_RAILS
 from sglang.srt.arg_groups.overrides import resolving_view
 from sglang.srt.configs.draft_parallel import DraftParallelLayout
 from sglang.srt.configs.hybrid_arch import (
@@ -1112,9 +1111,9 @@ class KVCacheConfigurator:
                     "the fused region holds dense MHA K/V rows"
                 )
             )
-        # The draft runner's backend, resolved as its worker will: an EAGLE
-        # draft with no backend of its own runs the target's prefill/decode
-        # pair. The published draft backend carries model-hook declarations.
+        # The draft runner's backend, resolved as its worker will, picks the
+        # region's KV dtype below. The published draft backend carries
+        # model-hook declarations.
         if self.spec_algorithm.is_dflash_family():
             from sglang.srt.speculative.draft_worker_common import (
                 resolve_draft_worker_attention_backend,
@@ -1123,19 +1122,6 @@ class KVCacheConfigurator:
             draft_backend = resolve_draft_worker_attention_backend()
         else:
             draft_backend = get_spec().speculative_draft_attention_backend
-        draft_backends = (
-            {draft_backend} if draft_backend else set(attention_backends()) - {None}
-        )
-        # A fused draft reads its rows through the KV-index translator, which
-        # other backends miss on some draft path.
-        if not draft_backends <= TRANSLATED_MHA_RAILS:
-            return FusedDraftDecision(
-                declined=(
-                    f"the draft runs on {', '.join(sorted(draft_backends))}, "
-                    "off the translated MHA rails "
-                    f"({', '.join(sorted(TRANSLATED_MHA_RAILS))})"
-                )
-            )
         # Under DCP each rank's host rows hold only its share of the widened
         # id space, while the draft never joins the DCP group and needs every
         # token; its translator also leaves the read ids widened for a DCP
@@ -1231,31 +1217,10 @@ class KVCacheConfigurator:
             ctx=PlacementContext(
                 host_names=self._unified_host_names(),
                 target_window=self.model_config.sliding_window_size,
-                asymmetric_rows_ok=self._draft_backends_carry_v_head_dim(),
-                draft_backends=self._draft_attention_backends(),
             ),
             store_dtype=_store_dtype_for(region_kv_dtype),
             kv_dtype=region_kv_dtype,
         )
-
-    def _draft_attention_backends(self) -> tuple:
-        """The backends the draft worker may run on: its explicit one, else
-        the target's, which it inherits."""
-        explicit = get_spec().speculative_draft_attention_backend
-        if explicit is not None:
-            return (explicit,)
-        return tuple(sorted(b for b in attention_backends() if b is not None))
-
-    def _draft_backends_carry_v_head_dim(self) -> bool:
-        """Whether every resolved attention backend, the draft's included,
-        carries v_head_dim through to the kernel (ASYMMETRIC_KV_BACKENDS). The
-        draft worker inherits the target's backend unless one is set."""
-        from sglang.srt.arg_groups.kv_cache_hook import ASYMMETRIC_KV_BACKENDS
-
-        backends = set(attention_backends())
-        backends.add(get_spec().speculative_draft_attention_backend)
-        backends.discard(None)
-        return backends <= ASYMMETRIC_KV_BACKENDS
 
     def fused_entry_bytes(self, sub_pool_name: str) -> Optional[int]:
         """Per-token bytes of ``sub_pool_name``'s fused entry (host + draft +

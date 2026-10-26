@@ -1978,8 +1978,11 @@ class TRTLLMHAAttnMultiStepDraftBackend(FlashInferMultiStepDraftBackend):
             )
 
     def init_forward_metadata(self, forward_batch: ForwardBatch):
+        # Each step writes its window layers at its own slice of the draft's
+        # write ids, never a prefix of every step's.
         for i in range(self.speculative_num_steps - 1):
-            self.attn_backends[i].init_forward_metadata(forward_batch)
+            with self._step_writes(forward_batch, i):
+                self.attn_backends[i].init_forward_metadata(forward_batch)
 
     def init_cuda_graph_state(self, max_bs: int, max_num_tokens: int):
         for i in range(self.speculative_num_steps - 1):
@@ -2004,9 +2007,10 @@ class TRTLLMHAAttnMultiStepDraftBackend(FlashInferMultiStepDraftBackend):
             encoder_lens=forward_batch.encoder_lens,
         )
         for i in range(self.speculative_num_steps - 1):
-            self.attn_backends[i].init_forward_metadata_out_graph(
-                inner_fb, in_capture=in_capture
-            )
+            with self._step_writes(inner_fb, i):
+                self.attn_backends[i].init_forward_metadata_out_graph(
+                    inner_fb, in_capture=in_capture
+                )
 
     def init_forward_metadata_in_graph(self, forward_batch: ForwardBatch) -> None:
         from sglang.srt.model_executor.forward_batch_info import build_inner_fb_view

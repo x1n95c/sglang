@@ -474,15 +474,6 @@ def handle_cache_compatibility(server_args: Any) -> None:
             )
 
 
-# The MHA backends that read through the KV-index translator on every path a
-# draft forward takes. A fused draft region holds dense K/V rows, so a fused
-# draft runs only on these. FA4 carries translated draft ids; of the fused
-# drafts only DSPARK's is validated on it.
-TRANSLATED_MHA_RAILS = frozenset({"triton", "flashinfer", "fa3", "trtllm_mha", "fa4"})
-# The rails a fused EAGLE/EAGLE3 draft is validated on.
-_EAGLE_DRAFT_RAILS = TRANSLATED_MHA_RAILS - {"fa4"}
-
-
 def handle_unified_memory_pool(server_args: Any) -> None:
 
     cfg = resolving_view(server_args)
@@ -571,20 +562,6 @@ def handle_unified_memory_pool(server_args: Any) -> None:
             "--enable-unified-memory + EAGLE/EAGLE3 requires a unified "
             "target (hybrid-SWA or a mamba hybrid): the draft's KV lives "
             "fused inside the target's sub-pool entries."
-        )
-        # An unset draft backend inherits the target's pair.
-        draft_backend = cfg.speculative_draft_attention_backend
-        draft_backends = (
-            {draft_backend}
-            if draft_backend
-            else set(attention_backends_of(resolved_view(server_args)))
-        )
-        assert draft_backends <= _EAGLE_DRAFT_RAILS, (
-            "--enable-unified-memory + EAGLE/EAGLE3 runs the draft on "
-            f"{sorted(draft_backends, key=str)}, but a fused draft is MHA-shaped "
-            "and reads its KV through the translated MHA rails "
-            f"{sorted(_EAGLE_DRAFT_RAILS)}. "
-            "Set --speculative-draft-attention-backend to one of them."
         )
     assert not cfg.enable_two_batch_overlap, (
         "--enable-unified-memory does not support --enable-two-batch-overlap: "
@@ -771,6 +748,20 @@ def handle_page_major_kv_layout(server_args: Any):
         f"{sorted(backends)} are not in the allowed set "
         f"{sorted(allowed_full)} for this configuration. Pass a compatible "
         "--attention-backend."
+    )
+    # A fused draft's rows are views of the same page-major entries, so a
+    # draft backend of its own reads asymmetric rows as the target's do. Every
+    # draft backend choice already addresses the views by their strides.
+    draft_backend = cfg.speculative_draft_attention_backend
+    assert not (
+        model_config.has_asymmetric_kv
+        and draft_backend is not None
+        and draft_backend not in ASYMMETRIC_KV_BACKENDS
+    ), (
+        "--enable-page-major-kv-layout: the model's K/V rows are asymmetric, "
+        f"and the draft attention backend {draft_backend!r} does not carry "
+        f"v_head_dim through to the kernel ({sorted(ASYMMETRIC_KV_BACKENDS)} "
+        "do). Pass one of them as --speculative-draft-attention-backend."
     )
     # The Mamba/KDA state is stored in envelope-strided views; only
     # stride-audited kernels may read it (Stage 4 audit, per slot):

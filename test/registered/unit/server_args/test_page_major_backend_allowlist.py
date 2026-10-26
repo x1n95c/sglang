@@ -54,6 +54,7 @@ def _accepts(
     linear_decode: str | None = None,
     linear_prefill: str | None = None,
     has_asymmetric_kv: bool = False,
+    draft_backend: str | None = None,
 ) -> bool:
     """Run just `handle_page_major_kv_layout` against a minimal stand-in, since
     ServerArgs' real constructor pulls in a model config."""
@@ -70,6 +71,7 @@ def _accepts(
         "linear_attn_decode_backend": linear_decode,
         "linear_attn_prefill_backend": linear_prefill,
         "mamba_backend": "triton",
+        "speculative_draft_attention_backend": draft_backend,
     }.items():
         msgspec.Struct.__setattr__(sa, name, value)
     setattr(
@@ -161,6 +163,34 @@ class TestPageMajorBackendAllowlist(unittest.TestCase):
                 _accepts(backend, use_mla=False, has_asymmetric_kv=True),
                 f"{backend} reads V at K's head_dim (or refuses unequal dims) "
                 "and must stay rejected for an asymmetric-K/V model",
+            )
+
+    def test_draft_backend_reads_asymmetric_rows_like_the_target(self):
+        """A fused draft's rows are views of the same entries, so a draft
+        backend of its own must carry v_head_dim for an asymmetric-K/V model."""
+        for draft_backend in ("triton", "fa3", "fa4"):
+            self.assertTrue(
+                _accepts(
+                    "triton",
+                    use_mla=False,
+                    has_asymmetric_kv=True,
+                    draft_backend=draft_backend,
+                ),
+                draft_backend,
+            )
+        for draft_backend in ("flashinfer", "trtllm_mha"):
+            self.assertFalse(
+                _accepts(
+                    "triton",
+                    use_mla=False,
+                    has_asymmetric_kv=True,
+                    draft_backend=draft_backend,
+                ),
+                draft_backend,
+            )
+            self.assertTrue(
+                _accepts("triton", use_mla=False, draft_backend=draft_backend),
+                draft_backend,
             )
 
     def test_asymmetric_dims_do_not_screen_out_mla(self):

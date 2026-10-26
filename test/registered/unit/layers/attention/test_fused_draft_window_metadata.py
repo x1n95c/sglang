@@ -11,6 +11,7 @@ from unittest.mock import patch
 
 import torch
 
+from sglang.srt.layers.attention import flashinfer_backend as fb
 from sglang.srt.layers.attention import triton_backend as tb
 from sglang.srt.layers.radix_attention import RadixAttention
 from sglang.srt.mem_cache.kv.alloc.chain import ChainAllocator, ChainRoles
@@ -46,7 +47,7 @@ class TestFusedDraftWindowMetadata(CustomTestCase):
         self.args = ServerArgs(model_path="dummy", page_size=1)
         publish(self.args, role="tokenizer")
 
-    def _fixture(self, window, target_window):
+    def _fixture(self, window, target_window, backend_kind="triton"):
         decision = place_fused_draft(
             profile=DraftKVProfile(
                 num_layers=1,
@@ -63,8 +64,6 @@ class TestFusedDraftWindowMetadata(CustomTestCase):
             ctx=PlacementContext(
                 host_names=("full", "swa") if target_window else ("full", "mamba"),
                 target_window=target_window,
-                asymmetric_rows_ok=False,
-                draft_backends=("triton",),
             ),
             store_dtype=torch.bfloat16,
         )
@@ -156,12 +155,22 @@ class TestFusedDraftWindowMetadata(CustomTestCase):
             sliding_window_size=window,
             kv_index_translator=reader,
             token_to_kv_pool=bound.token_to_kv_pool,
+            page_size=1,
         )
         # The model's per-step attention is outside this metadata test. All
         # placement, allocation, translation and multi-step metadata are real.
-        inner = SimpleNamespace(max_context_len=512)
-        with patch.object(tb, "TritonAttnBackend", return_value=inner):
-            backend = tb.TritonMultiStepDraftBackend(runner, 1, 3)
+        if backend_kind == "triton":
+            inner = SimpleNamespace(max_context_len=512)
+            with patch.object(tb, "TritonAttnBackend", return_value=inner):
+                backend = tb.TritonMultiStepDraftBackend(runner, 1, 3)
+        else:
+            # Whether the step backend writes a window sub-pool, as
+            # FlashInferAttnBackend resolves it for this runner.
+            inner = SimpleNamespace(
+                max_context_len=512, use_sliding_window_kv_pool=host == "swa"
+            )
+            with patch.object(fb, "FlashInferAttnBackend", return_value=inner):
+                backend = fb.FlashInferMultiStepDraftBackend(runner, 1, 3)
         rows = torch.zeros(1, dtype=torch.int64, device="cuda")
         seq_lens = torch.tensor([300], dtype=torch.int32, device="cuda")
         plan = reader.plan(
@@ -173,22 +182,27 @@ class TestFusedDraftWindowMetadata(CustomTestCase):
         )
         batch = SimpleNamespace(
             batch_size=1,
-            seq_lens_sum=None,
+            seq_lens_sum=None if backend_kind == "triton" else 300,
             seq_lens=seq_lens,
+            seq_lens_cpu=None,
             req_pool_indices=rows,
             positions=seq_lens.to(torch.int64),
             kv_loc_plan=plan,
-            spec_info=SimpleNamespace(window_kv_indices=None, window_kv_indptr=None),
+            spec_info=SimpleNamespace(
+                window_kv_indices=None,
+                window_kv_indptr=None,
+                is_draft_input=lambda: True,
+            ),
         )
         full = allocator.translate_kv_loc(virtual)
         swa = allocator.id_spaces()[IdSpaceKind.SLIDING_WINDOW].ids(virtual)
         self.assertFalse(torch.equal(full, swa))
-        return backend, batch, full if host == "full" else swa
+        return backend, batch, full if host == "full" else swa, host
 
     def test_window_reads_follow_placement_in_eager_and_graph(self):
         for window, target_window in ((256, 128), (64, None), (64, 128)):
             with self.subTest(window=window, target_window=target_window):
-                backend, batch, physical = self._fixture(window, target_window)
+                backend, batch, physical, _ = self._fixture(window, target_window)
                 full_ids = torch.empty((3, 512), dtype=torch.int64, device="cuda")
                 window_ids = torch.zeros((3, window), dtype=torch.int64, device="cuda")
                 observed = []
@@ -230,6 +244,56 @@ class TestFusedDraftWindowMetadata(CustomTestCase):
                 batch.positions.fill_(301)
                 graph.replay()
                 check(301)
+
+    def test_flashinfer_window_reads_take_their_own_rail(self):
+        """BUG REGRESSION. A flashinfer multi-step draft of a window model
+        could not start (its step backends took one wrapper), and its window
+        wrapper read the shared draft indices, FULL ids, with no translation
+        when reads are translated. Each step now reads a rail of the last
+        window + 1 tokens (the decode window wrapper's span) in the ids of
+        the storage its window layers live in."""
+        for window, target_window in ((256, 128), (64, None), (64, 128)):
+            with self.subTest(window=window, target_window=target_window):
+                backend, batch, physical, _ = self._fixture(
+                    window, target_window, backend_kind="flashinfer"
+                )
+                self.assertTrue(backend.window_rail)
+                full_ids = torch.empty((3, 512), dtype=torch.int32, device="cuda")
+                window_ids = torch.zeros(
+                    (3, window + 1), dtype=torch.int32, device="cuda"
+                )
+                observed = []
+
+                def collect(step, fb_):
+                    observed.append(
+                        (
+                            step,
+                            fb_.spec_info.window_kv_indptr,
+                            fb_.spec_info.window_kv_indices,
+                            fb.global_override_window_indptr_cpu,
+                        )
+                    )
+
+                for length in (300, 301):
+                    batch.seq_lens.fill_(length)
+                    batch.positions.fill_(length)
+                    observed.clear()
+                    backend.common_template(batch, full_ids, collect, window_ids)
+                    self.assertEqual(len(observed), 2)
+                    for step, indptr, indices, host_indptr in observed:
+                        end = length + step + 1
+                        span = window + 1
+                        expected_indptr = torch.tensor(
+                            [0, span], dtype=torch.int32, device="cuda"
+                        )
+                        torch.testing.assert_close(indptr, expected_indptr)
+                        torch.testing.assert_close(
+                            host_indptr, expected_indptr.cpu(), rtol=0, atol=0
+                        )
+                        torch.testing.assert_close(
+                            indices.to(torch.int64), physical[end - span : end]
+                        )
+                    self.assertIsNone(fb.global_override_window_indptr_cpu)
 
 
 if __name__ == "__main__":

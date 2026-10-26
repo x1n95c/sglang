@@ -22,14 +22,12 @@ Pinned:
   - a per-depth head serves one depth per runner and needs one runner per
     depth;
   - a draft with a layer kind no registered host kind serves declines, and
-    so do asymmetric K/V rows unless every resolved backend, the draft's
-    included, carries v_head_dim through to the kernel;
-  - so does a draft whose attention backend is off the translated MHA rails
-    (it would read the fused rows with virtual ids), a draft under
-    --dcp-size > 1 (each rank's rows hold only its share of the tokens), an
-    explicit draft KV dtype unlike the host's, and a draft under HiCache or
-    host-pool decode retraction (they build the draft's host pool off a
-    device pool of its own);
+    so does a draft under --dcp-size > 1 (each rank's rows hold only its
+    share of the tokens), an explicit draft KV dtype unlike the host's, and
+    a draft under HiCache or host-pool decode retraction (they build the
+    draft's host pool off a device pool of its own);
+  - no attention backend takes part: a fused draft reads its rows through
+    the same views and id spaces as the target, whatever backend it runs;
   - the profile divides the draft's heads by attn_tp, as the target does,
     and owns recurrent state only for a per-depth conv-chain head;
   - the registry refuses a duplicate host or a second primary host for one
@@ -45,7 +43,6 @@ from unittest.mock import patch
 
 import torch
 
-from sglang.srt.arg_groups.kv_cache_hook import ASYMMETRIC_KV_BACKENDS
 from sglang.srt.mem_cache import kv_cache_configurator as kcc
 from sglang.srt.mem_cache.layout.fused_draft import (
     FULL_HOST,
@@ -117,23 +114,11 @@ def _profile(
     return DraftKVProfile(num_layers=num_layers, num_depths=num_depths, kinds=kinds)
 
 
-def _place(
-    profile,
-    num_runners=1,
-    asymmetric_rows_ok=False,
-    host_names=_HOSTS,
-    target_window=None,
-    draft_backends=("triton",),
-):
+def _place(profile, num_runners=1, host_names=_HOSTS, target_window=None):
     return place_fused_draft(
         profile=profile,
         num_runners=num_runners,
-        ctx=PlacementContext(
-            host_names=host_names,
-            target_window=target_window,
-            asymmetric_rows_ok=asymmetric_rows_ok,
-            draft_backends=draft_backends,
-        ),
+        ctx=PlacementContext(host_names=host_names, target_window=target_window),
         store_dtype=_DTYPE,
     )
 
@@ -230,20 +215,6 @@ class TestPlaceFusedDraft(CustomTestCase):
         self.assertIsNone(decision.placement)
         self.assertIn("cannot share", decision.declined)
 
-    def test_a_window_draft_needs_a_rail_carrying_draft_backend(self):
-        """Only the Triton multi-step draft backend builds the per-step window
-        rails; any other draft backend would sink-write the window layers."""
-        decision = _place(
-            _profile(window_layer_ids=(0,), window=128),
-            target_window=128,
-            draft_backends=("fa3",),
-        )
-        self.assertIsNone(decision.placement)
-        self.assertIn("['fa3']", decision.declined)
-        self.assertIn("triton", decision.declined)
-        # A full-only draft never consults the rail rule.
-        self.assertIsNotNone(_place(_profile(), draft_backends=("fa3",)).placement)
-
     def test_per_depth_head_needs_one_runner_per_depth(self):
         self.assertIsNone(_place(_profile(num_layers=8, num_depths=8), 1).placement)
         self.assertIsNone(_place(_profile(num_layers=8, num_depths=8), 9).placement)
@@ -289,30 +260,22 @@ class TestPlaceFusedDraft(CustomTestCase):
                 self.assertIsNone(decision.placement)
                 self.assertIn(f"1 {noun} layer(s)", decision.declined)
 
-    def test_asymmetric_and_misaligned_rows_decline(self):
-        for profile, reason in (
-            (_profile(head_dim=64, v_head_dim=32), "asymmetric"),
-            # 4 heads x 5 dims x 2 B = 40 B: not a 16-B-aligned entry part.
-            (_profile(head_dim=5, v_head_dim=5), "40 B"),
-        ):
-            decision = _place(profile)
-            self.assertIsNone(decision.placement)
-            self.assertIn(reason, decision.declined)
+    def test_misaligned_rows_decline(self):
+        # 4 heads x 5 dims x 2 B = 40 B: not a 16-B-aligned entry part.
+        decision = _place(_profile(head_dim=5, v_head_dim=5))
+        self.assertIsNone(decision.placement)
+        self.assertIn("40 B", decision.declined)
 
-    def test_asymmetric_rows_fuse_with_their_v_width_when_backends_allow(self):
-        placement = _place(
-            _profile(head_dim=64, v_head_dim=32), asymmetric_rows_ok=True
-        ).placement
+    def test_asymmetric_rows_fuse_with_their_v_width(self):
+        placement = _place(_profile(head_dim=64, v_head_dim=32)).placement
         self.assertIsNotNone(placement)
         self.assertEqual(placement.region("full").resolved_v_head_dim(), 32)
         self.assertEqual(placement.region("full").entry_bytes(), 4 * (64 + 32) * 2)
-        # Symmetric rows never consult the rule.
-        self.assertIsNotNone(_place(_profile(), asymmetric_rows_ok=False).placement)
 
-    def test_a_misaligned_v_row_declines_even_when_backends_allow(self):
+    def test_a_misaligned_v_row_declines(self):
         # K rows are 4 x 64 x 2 B = 512 B; V rows 4 x 5 x 2 B = 40 B are not a
         # 16-B-aligned entry part.
-        decision = _place(_profile(head_dim=64, v_head_dim=5), asymmetric_rows_ok=True)
+        decision = _place(_profile(head_dim=64, v_head_dim=5))
         self.assertIsNone(decision.placement)
         self.assertIn("40 B", decision.declined)
 
@@ -401,37 +364,6 @@ class TestDraftKVProfile(CustomTestCase):
         state = profile.kinds[LAYER_STATE]
         self.assertEqual(state.layer_ids, (0, 1))
         self.assertEqual(state.geometry, _STATE)
-
-
-class TestAsymmetricBackendRule(CustomTestCase):
-    """The rule reads the TARGET's resolved backends and the draft's explicit
-    one (unset inherits the target's); one shared-head_dim backend anywhere
-    disqualifies asymmetric rows."""
-
-    def _carries(self, *, backends, draft_backend=None):
-        cfg = kcc.KVCacheConfigurator.__new__(kcc.KVCacheConfigurator)
-        with (
-            patch.object(kcc, "attention_backends", return_value=tuple(backends)),
-            patch.object(
-                kcc,
-                "get_spec",
-                return_value=SimpleNamespace(
-                    speculative_draft_attention_backend=draft_backend
-                ),
-            ),
-        ):
-            return cfg._draft_backends_carry_v_head_dim()
-
-    def test_every_split_stride_backend_qualifies(self):
-        for backend in sorted(ASYMMETRIC_KV_BACKENDS):
-            self.assertTrue(self._carries(backends=(backend,)), backend)
-
-    def test_a_shared_head_dim_backend_anywhere_disqualifies(self):
-        self.assertNotIn("flashinfer", ASYMMETRIC_KV_BACKENDS)
-        self.assertFalse(self._carries(backends=("flashinfer",)))
-        self.assertFalse(
-            self._carries(backends=("triton",), draft_backend="flashinfer")
-        )
 
 
 class TestHostKindRegistry(CustomTestCase):
@@ -858,26 +790,19 @@ class TestFusedDraftDecision(CustomTestCase):
             )
             self.assertIsNotNone(placed.placement, algorithm)
 
-    def test_a_draft_off_the_translated_rails_keeps_the_private_pool(self):
-        """A fused draft reads its rows through the KV-index translator, which
-        triton, flashinfer, fa3, fa4 and trtllm_mha carry on draft paths.
-        The draft's backend is the published one, a model hook's declaration
-        included; otherwise it is what the draft runner inherits from the
-        target."""
-        declined = self._decide(algorithm="EAGLE", draft_backend="flashmla")
-        self.assertIsNone(declined.placement)
-        self.assertIn("flashmla", declined.declined)
-        # A DFLASH-family draft runs the target's prefill backend, or the
-        # platform default when that is not a draft backend.
-        for target_backends, fuses in (
-            (("fa4", "fa4"), True),
-            (("fa3", "flashmla"), True),
-            (("flashmla", "flashmla"), True),
-        ):
-            decision = self._decide(algorithm="DSPARK", target_backends=target_backends)
-            self.assertEqual(decision.placement is not None, fuses, target_backends)
-        # An EAGLE draft with no backend of its own runs the target's pair.
-        self.assertIsNone(self._decide(target_backends=("fa3", "flashmla")).placement)
+    def test_no_draft_backend_keeps_the_private_pool(self):
+        """A fused draft reads its rows through the target's views and id
+        spaces, so the draft's backend, named or inherited, never decides
+        whether it fuses."""
+        self.assertIsNotNone(
+            self._decide(algorithm="EAGLE", draft_backend="flashmla").placement
+        )
+        for target_backends in (("fa4", "fa4"), ("fa3", "flashmla")):
+            for algorithm in ("EAGLE", "DSPARK"):
+                decision = self._decide(
+                    algorithm=algorithm, target_backends=target_backends
+                )
+                self.assertIsNotNone(decision.placement, (algorithm, target_backends))
 
     def test_a_fa4_dspark_draft_fuses(self):
         decision = self._decide(algorithm="DSPARK", draft_backend="fa4")
