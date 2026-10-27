@@ -623,14 +623,15 @@ class Scheduler(
                 cache_controller.write_fence_stream = (
                     self.tp_worker.model_runner.forward_stream
                 )
-                if self.enable_unified_memory:
-                    # Keep device rows stable until host transfers are acknowledged.
-                    # Queue reads and relocation both run on the scheduler thread.
-                    storage = self.token_to_kv_pool_allocator.storage
-                    storage.add_pin_source(
-                        storage.sub_pool_names(),
-                        cache_controller.has_inflight_device_transfers,
-                    )
+                # Keep device rows stable until host transfers are acknowledged.
+                # Queue reads and relocation both run on the scheduler thread.
+                storage = kv_storage_of(
+                    self.req_to_token_pool, self.token_to_kv_pool_allocator
+                )
+                storage.add_pin_source(
+                    storage.sub_pool_names(),
+                    cache_controller.has_inflight_device_transfers,
+                )
         self.emit_metrics_constants()
         self.maybe_init_hccl_dp_prewarm()
 
@@ -1644,11 +1645,10 @@ class Scheduler(
 
             self.enable_staging = envs.SGLANG_DISAGG_STAGING_BUFFER.get()
 
-        if (
-            self.enable_unified_memory
-            and self.disaggregation_mode != DisaggregationMode.NULL
-        ):
-            storage = self.token_to_kv_pool_allocator.storage
+        if self.disaggregation_mode != DisaggregationMode.NULL:
+            storage = kv_storage_of(
+                self.req_to_token_pool, self.token_to_kv_pool_allocator
+            )
             storage.add_pin_source(
                 storage.sub_pool_names(), disagg_transfers_in_flight(self)
             )
