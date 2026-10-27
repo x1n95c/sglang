@@ -2058,7 +2058,7 @@ def build_hicache_draft_sidecars(
 ) -> tuple[list[SidecarPoolSpec], list[PoolEntry]]:
     """Compose the full and SWA draft-sidecar paths."""
     from sglang.srt.mem_cache.deepseek_v4_memory_pool import DeepSeekV4TokenToKVPool
-    from sglang.srt.mem_cache.kv_loc_plan import IdSpaceKind
+    from sglang.srt.mem_cache.kv.alloc.id_space import IdSpaceKind
 
     assert len(draft_device_pools) == 1
     draft_kv_pool = draft_device_pools[0]
@@ -2341,7 +2341,7 @@ def _swa_layer_mappings(kvcache) -> tuple[dict[int, int], dict[int, int]]:
 
 class _SwaStrategy(StackStrategy):
     def matches(self, kvcache, components):
-        from sglang.srt.mem_cache.kv_loc_plan import IdSpaceKind
+        from sglang.srt.mem_cache.kv.alloc.id_space import IdSpaceKind
 
         return kvcache.layer_router.sub_pool(
             IdSpaceKind.SLIDING_WINDOW
@@ -2392,7 +2392,7 @@ class _SwaStrategy(StackStrategy):
 
 class _MambaSwaStrategy(StackStrategy):
     def matches(self, kvcache, components):
-        from sglang.srt.mem_cache.kv_loc_plan import IdSpaceKind
+        from sglang.srt.mem_cache.kv.alloc.id_space import IdSpaceKind
 
         return kvcache.layer_router.sub_pool(
             IdSpaceKind.SLIDING_WINDOW
