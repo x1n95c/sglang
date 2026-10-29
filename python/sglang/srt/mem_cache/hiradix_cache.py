@@ -45,7 +45,9 @@ class HiRadixCache(RadixCache):
         # todo: dynamically adjust the threshold
         self.write_through_threshold = 1
         self.load_back_threshold = 10
-        super().__init__(req_to_token_pool, token_to_kv_pool_allocator, disable=False)
+        super().__init__(
+            req_to_token_pool, token_to_kv_pool_allocator, page_size=1, disable=False
+        )
 
     def reset(self):
         TreeNode.counter = 0
